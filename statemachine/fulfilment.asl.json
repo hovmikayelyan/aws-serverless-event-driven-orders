@@ -1,0 +1,83 @@
+{
+  "Comment": "Order fulfilment saga: validate -> parallel(reserve, charge) -> wait -> ship; compensate on failure",
+  "StartAt": "Validate",
+  "States": {
+    "Validate": {
+      "Type": "Task",
+      "Resource": "${StepsFunctionArn}",
+      "Parameters": {"action": "validate", "order.$": "$.detail"},
+      "ResultPath": null,
+      "Next": "ReserveAndCharge",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Rejected"}]
+    },
+    "ReserveAndCharge": {
+      "Type": "Parallel",
+      "Comment": "Fan-out / fan-in",
+      "Branches": [
+        {
+          "StartAt": "ReserveInventory",
+          "States": {
+            "ReserveInventory": {
+              "Type": "Task",
+              "Resource": "${StepsFunctionArn}",
+              "Parameters": {"action": "reserve_inventory", "order.$": "$.detail"},
+              "Retry": [{
+                "ErrorEquals": ["TransientError", "Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+                "IntervalSeconds": 1, "BackoffRate": 2.0, "MaxAttempts": 4, "JitterStrategy": "FULL"
+              }],
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "ChargePayment",
+          "States": {
+            "ChargePayment": {
+              "Type": "Task",
+              "Resource": "${StepsFunctionArn}",
+              "Parameters": {"action": "charge_payment", "order.$": "$.detail"},
+              "Retry": [{
+                "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+                "IntervalSeconds": 1, "BackoffRate": 2.0, "MaxAttempts": 3, "JitterStrategy": "FULL"
+              }],
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.results",
+      "Next": "WaitForWarehouse",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Compensate"}]
+    },
+    "WaitForWarehouse": {
+      "Type": "Wait",
+      "Comment": "Long-running orchestration; no compute is billed while waiting",
+      "Seconds": 5,
+      "Next": "Ship"
+    },
+    "Ship": {
+      "Type": "Task",
+      "Resource": "${StepsFunctionArn}",
+      "Parameters": {"action": "ship", "order.$": "$.detail"},
+      "ResultPath": "$.shipment",
+      "End": true,
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Compensate"}]
+    },
+    "Compensate": {
+      "Type": "Parallel",
+      "Comment": "Saga compensation (idempotent, best-effort in any order)",
+      "Branches": [
+        {"StartAt": "ReleaseInventory", "States": {"ReleaseInventory": {
+          "Type": "Task", "Resource": "${StepsFunctionArn}",
+          "Parameters": {"action": "release_inventory", "order.$": "$.detail"}, "End": true}}},
+        {"StartAt": "RefundPayment", "States": {"RefundPayment": {
+          "Type": "Task", "Resource": "${StepsFunctionArn}",
+          "Parameters": {"action": "refund_payment", "order.$": "$.detail"}, "End": true}}}
+      ],
+      "ResultPath": null,
+      "Next": "OrderFailed"
+    },
+    "Rejected": {"Type": "Fail", "Error": "OrderRejected", "Cause": "Validation failed"},
+    "OrderFailed": {"Type": "Fail", "Error": "OrderFailed", "Cause": "Saga compensated"}
+  }
+}

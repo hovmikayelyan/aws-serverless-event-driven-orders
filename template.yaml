@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Orders platform - cold-start optimized API, EventBridge fan-out with DLQs, Step Functions saga, observability
+
+Parameters:
+  IngestProvisionedConcurrency:
+    Type: Number
+    Default: 1
+    Description: Provisioned concurrency for the latency-sensitive ingest function (0 to disable)
+
+Conditions:
+  UseProvisioned: !Not [!Equals [!Ref IngestProvisionedConcurrency, 0]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]          # ~20% cheaper, equal/better init time
+    MemorySize: 512                 # more memory => proportionally more CPU => faster init+exec
+    Timeout: 10
+    Tracing: Active                 # X-Ray
+    CodeUri: src/
+    Environment:
+      Variables:
+        EVENT_BUS: !Ref OrdersBus
+        IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+        PYTHONDONTWRITEBYTECODE: "1"
+        POWERTOOLS_SERVICE_NAME: orders
+
+Resources:
+  # ---------------------------------------------------------------- backbone
+  OrdersBus:
+    Type: AWS::Events::EventBus
+    Properties: {Name: !Sub "${AWS::StackName}-orders"}
+
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: pk, AttributeType: S}]
+      KeySchema: [{AttributeName: pk, KeyType: HASH}]
+      TimeToLiveSpecification: {AttributeName: expires_at, Enabled: true}
+
+  # ---------------------------------------------------- 1. cold-start optimized
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handlers.ingest.handler
+      AutoPublishAlias: live         # alias required for provisioned concurrency
+      ProvisionedConcurrencyConfig: !If
+        - UseProvisioned
+        - {ProvisionedConcurrentExecutions: !Ref IngestProvisionedConcurrency}
+        - !Ref AWS::NoValue
+      Policies:
+        - EventBridgePutEventsPolicy: {EventBusName: !Ref OrdersBus}
+      Events:
+        Api:
+          Type: Api
+          Properties: {Path: /orders, Method: post}
+
+  # ---------------------------------------------------- 3. fan-out: 3 consumers
+  # Each consumer has: filter rule -> SQS buffer -> Lambda, plus a DLQ with redrive after 3 attempts.
+  BillingDLQ: {Type: AWS::SQS::Queue, Properties: {MessageRetentionPeriod: 1209600}}
+  InventoryDLQ: {Type: AWS::SQS::Queue, Properties: {MessageRetentionPeriod: 1209600}}
+  NotificationsDLQ: {Type: AWS::SQS::Queue, Properties: {MessageRetentionPeriod: 1209600}}
+
+  BillingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60          # >= 6x function timeout
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt BillingDLQ.Arn, maxReceiveCount: 3}
+  InventoryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt InventoryDLQ.Arn, maxReceiveCount: 3}
+  NotificationsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt NotificationsDLQ.Arn, maxReceiveCount: 3}
+
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref BillingQueue, !Ref InventoryQueue, !Ref NotificationsQueue]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource:
+              - !GetAtt BillingQueue.Arn
+              - !GetAtt InventoryQueue.Arn
+              - !GetAtt NotificationsQueue.Arn
+            Condition: {ArnLike: {"aws:SourceArn": !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${OrdersBus}/*"}}
+
+  # EventBridge delivery failures (target unreachable) land here instead of being dropped.
+  EventDeliveryDLQ: {Type: AWS::SQS::Queue}
+  EventDeliveryDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventDeliveryDLQ]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventDeliveryDLQ.Arn
+
+  BillingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref OrdersBus
+      EventPattern: {source: [orders.api], detail-type: [OrderPlaced]}      # all orders
+      Targets:
+        - Id: billing
+          Arn: !GetAtt BillingQueue.Arn
+          DeadLetterConfig: {Arn: !GetAtt EventDeliveryDLQ.Arn}
+          RetryPolicy: {MaximumRetryAttempts: 5, MaximumEventAgeInSeconds: 3600}
+  InventoryRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref OrdersBus
+      EventPattern: {source: [orders.api], detail-type: [OrderPlaced]}
+      Targets:
+        - Id: inventory
+          Arn: !GetAtt InventoryQueue.Arn
+          DeadLetterConfig: {Arn: !GetAtt EventDeliveryDLQ.Arn}
+          RetryPolicy: {MaximumRetryAttempts: 5, MaximumEventAgeInSeconds: 3600}
+  NotificationsRule:                   # filtering rule: only high-priority orders notify
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref OrdersBus
+      EventPattern:
+        source: [orders.api]
+        detail-type: [OrderPlaced]
+        detail: {priority: [high]}
+      Targets:
+        - Id: notifications
+          Arn: !GetAtt NotificationsQueue.Arn
+          DeadLetterConfig: {Arn: !GetAtt EventDeliveryDLQ.Arn}
+          RetryPolicy: {MaximumRetryAttempts: 5, MaximumEventAgeInSeconds: 3600}
+
+  BillingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handlers.consumer.handler
+      Environment: {Variables: {CONSUMER_NAME: billing}}
+      Policies: [DynamoDBCrudPolicy: {TableName: !Ref IdempotencyTable}]
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt BillingQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig: {MaximumConcurrency: 5}   # protect the downstream DB from spikes
+  InventoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handlers.consumer.handler
+      Environment: {Variables: {CONSUMER_NAME: inventory}}
+      Policies: [DynamoDBCrudPolicy: {TableName: !Ref IdempotencyTable}]
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt InventoryQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig: {MaximumConcurrency: 5}
+  NotificationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handlers.consumer.handler
+      Environment: {Variables: {CONSUMER_NAME: notifications}}
+      Policies: [DynamoDBCrudPolicy: {TableName: !Ref IdempotencyTable}]
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt NotificationsQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig: {MaximumConcurrency: 2}
+
+  # ------------------------------------------------ 2. workflow orchestration
+  StepsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handlers.steps.handler
+
+  FulfilmentStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachine/fulfilment.asl.json
+      DefinitionSubstitutions: {StepsFunctionArn: !GetAtt StepsFunction.Arn}
+      Tracing: {Enabled: true}
+      Logging:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup: {LogGroupArn: !GetAtt StateMachineLogs.Arn}
+      Policies:
+        - LambdaInvokePolicy: {FunctionName: !Ref StepsFunction}
+        - CloudWatchLogsFullAccess
+      Events:
+        BigOrders:                     # only orders >= 100 go through the saga
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref OrdersBus
+            Pattern:
+              source: [orders.api]
+              detail-type: [OrderPlaced]
+              detail: {amount: [{numeric: [">=", 100]}]}
+  StateMachineLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {RetentionInDays: 14}
+
+  # ---------------------------------------------------------- 5. observability
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Any message in a consumer DLQ needs attention
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt BillingDLQ.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  SagaFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions: [{Name: StateMachineArn, Value: !Ref FulfilmentStateMachine}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-orders"
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Cold starts / accepted orders","region":"${AWS::Region}","stat":"Sum","period":60,
+            "metrics":[["OrdersPlatform","ColdStart","Function","${IngestFunction}"],["OrdersPlatform","OrdersAccepted","Function","${IngestFunction}"]]}},
+          {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Consumer processed / failed","region":"${AWS::Region}","stat":"Sum","period":60,
+            "metrics":[["OrdersPlatform","Processed","Function","${BillingFunction}","Consumer","billing"],[".","Failed",".",".",".","."]]}},
+          {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"DLQ depth","region":"${AWS::Region}","stat":"Maximum","period":60,
+            "metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${BillingDLQ.QueueName}"],["...","${InventoryDLQ.QueueName}"],["...","${NotificationsDLQ.QueueName}"]]}},
+          {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Saga executions","region":"${AWS::Region}","stat":"Sum","period":60,
+            "metrics":[["AWS/States","ExecutionsSucceeded","StateMachineArn","${FulfilmentStateMachine}"],["AWS/States","ExecutionsFailed","StateMachineArn","${FulfilmentStateMachine}"]]}}
+        ]}
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/orders"
+  BillingDLQUrl: {Value: !Ref BillingDLQ}
+  StateMachineArn: {Value: !Ref FulfilmentStateMachine}
